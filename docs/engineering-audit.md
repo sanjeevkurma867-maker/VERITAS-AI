@@ -19,22 +19,22 @@ An IPL win can disprove a franchise-wide assertion of zero trophies. Proving the
 
 | Check | Result |
 | --- | --- |
-| Unit and API suite | 57 passed. Zero failed or skipped. Tests cover the five verdicts, source and subject scope, prompt injection, stale caching, source conflicts, provider failures, and malformed or ungrounded model output. |
+| Unit and API suite | 64 passed. Zero failed or skipped. This includes the submission claim matrix, source and subject scope, prompt injection, stale caching, provider failures, and malformed or ungrounded model output. The first Moon landing case records the first crewed landing interpretation. |
 | Build, backend and API | Vite production build, dev startup and API proxy passed. Fresh Uvicorn served `/health`, `/openapi.json`, and the production dashboard. API tests exercised both demo and live report schemas. |
-| Browser | Chromium passed the three recorded scenarios, Then → Change → Now, filters, citation links, copy correction, copy report, JSON export, keyboard focus, invalid-input recovery, loading, and live Search at 390 px. |
-| Tavily Search | Actual provider requests returned page-backed verdicts for Python 2 and Mandela. The warm repeat retained the sources’ original retrieval time and marked them cached. |
-| Tavily Research and Extract | One live Research probe hit a request or credit limit, so this run could not reach Extract. Tests exercise successful quote grounding, unmatched quotes, unknown URLs, provider outages, and cooldown. The prior release’s live Research results predate this quote-grounding path. |
+| Browser | This pass checked all three recorded scenarios, the timeline, filters, citation links, both clipboard actions, JSON export, keyboard focus, invalid-input recovery, and layout at 390 px. A prior browser run exercised live loading and Search. |
+| Tavily Search | The exact current-tense Pluto test returned **Outdated**, 1/1 coverage, and the former, change and present evidence from a NASA page. Live tests in earlier passes also resolved undated historical classification, Python 2 maintenance, and Mandela’s release. [NASA Pluto overview](https://science.nasa.gov/dwarf-planets/pluto/) |
+| Tavily Research and Extract | The reported live failure was HTTP 432, the plan usage limit. This pass used simulated provider responses. The quota test advances the clock by 24 hours and confirms that a 432 response without `Retry-After` causes no further Research call within the process. |
 | Bifrost → Groq | Local gateway health returned HTTP 200. Protected configuration returned HTTP 401. Earlier unauthenticated inference returned HTTP 401. Success, timeout, auth failure and malformed output are simulated in tests. |
 
 ### Reported claim cases
 
 | Case | Verified behavior and limits |
 | --- | --- |
-| A–C · Pluto current and historical states | Recorded scenarios and classifier tests exercise stale, historically correct, and supported current results. The 2006 resolution is the recorded change. [IAU resolution](https://www.iau.org/IAU/Iau/News/PR2006/iau-2006-general-assembly-resolution-votes.aspx) |
+| A–C · Pluto current and historical states | The current-tense ninth-planet claim resolved live with Search. The 2005 claim and supported current classification passed the mocked submission matrix. The 2006 resolution is the recorded change. [IAU resolution](https://www.iau.org/IAU/Iau/News/PR2006/iau-2006-general-assembly-resolution-votes.aspx) |
 | D · Earth has three moons | The earlier observed contradiction uses the conventional permanent natural satellite interpretation. The current reasoning prompt requires stating a consequential interpretation and otherwise retaining uncertainty. No fresh live semantic verdict was run for this exact claim. [NASA Earth facts](https://science.nasa.gov/earth/facts/) |
 | E · UK prime minister | Checked independently against government records. As of November 21, 2026, the UK government lists Andy Burnham, in office since July 20, 2026. It lists Rishi Sunak’s tenure as October 25, 2022 to July 5, 2024. This supports the observed obsolete Sunak claim. This release did not rerun the claim through live Research. [Current prime minister](https://www.gov.uk/government/ministers/prime-minister) · [Rishi Sunak](https://www.gov.uk/government/people/rishi-sunak) |
 | F and H · Python 2 and Mandela | Live Search returned **Outdated** for Python 2, including the wording naming the PSF, and **Historically correct** for Mandela’s release in 1990. [Python 2 sunset](https://www.python.org/doc/sunset-python-2/) · [Nelson Mandela Foundation](https://www.nelsonmandela.org/news/entry/nelson-mandelas-release-from-prison-33-years-on) |
-| G and J · Mixed and competing statements | The live Search-only run used the exact three claims from G plus the RCB shorthand. Python 2 was **Outdated**. Pluto, Earth’s moon count and RCB remained **Needs review**. J was covered by the recorded Pluto cases and classifier tests. Its exact current-versus-current input was not rerun live. |
+| G and J · Mixed and competing statements | In a prior Search-only run with the exact three claims from G plus RCB, Python 2 resolved and the other claims needed review. This pass resolved the stale Pluto claim in a separate live request. A mocked multi-claim run resolved Pluto and Earth independently. |
 | I · Sensational claim about yesterday | The relative event parser resolves a UTC day. Missing trustworthy point evidence stays in review. Regression tests cover date mismatches and undated or unsupported passages. |
 | K and L · Injection and ambiguous definitions | The suite rejects instruction-only input and injected source passages, and checks unclear scope. Gateway and Research prompts require an explicit interpretation when alternate definitions affect a verdict. The exact geopolitical input was not verified live this run. |
 
@@ -49,7 +49,8 @@ One controlled local comparison used the same two claims with Research disabled.
 | Updated fallback, warm Search cache | 28–30 ms | 2/2 |
 | Updated fallback, cold qualified Python claim | 273–398 ms | 1/1 |
 | Updated fallback, fresh browser process | 529 ms | 2/2 |
-| Updated fallback, mixed astronomy, lifecycle and trophy claims | 4,176 ms | 1/4 |
+| Prior fallback, mixed astronomy, lifecycle and trophy claims | 4,176 ms | 1/4 |
+| Final live Search-only Pluto reclassification | 1,910 ms | 1/1 |
 
 The 518 ms cold run spent 504 ms waiting on Tavily Search and 13 ms on passage checks. The installed Tavily Python SDK was 0.8.5, and the app uses HTTPX for the Search, Research and Extract REST APIs. Cache keys account for credentials via a digest, query, scope and UTC day. Current evidence expires after two minutes and historical or stable evidence after ten. FastAPI records stage timings and counts, omitting claims, provider bodies and credentials. The cache is process-local. Research and Bifrost latency cannot be inferred from the Search measurements.
 

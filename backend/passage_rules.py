@@ -1,17 +1,22 @@
 """Conservative verification for a few explicitly stated claim forms."""
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from unicodedata import normalize
 
 if __package__:
-    from .claims import LEADING_PERIOD, SENTENCE_BREAK, temporal_hint
+    from .claims import LEADING_PERIOD, SENTENCE_BREAK, YEAR_PATTERN, temporal_hint
 else:
-    from claims import LEADING_PERIOD, SENTENCE_BREAK, temporal_hint
+    from claims import LEADING_PERIOD, SENTENCE_BREAK, YEAR_PATTERN, temporal_hint
 
 LIFECYCLE = re.compile(r"^(.{2,80}?) is (?:currently |still )?(?:officially )?supported(?: by (.{2,90}))?$", re.I)
 PROVENANCE = re.compile(r"^(.{2,80}?) was (created|invented|founded) by (.{2,100})$", re.I)
 DATED_EVENT = re.compile(r"^(.{2,100}?) (was|were) (released|launched|opened|signed|ratified|founded|discovered)(?: (.{2,100}))?$", re.I)
+PAST_CONSIDERED = r"(?:was|were) (?:(?:once|long|formerly|previously) )?considered(?: to be)?"
+HISTORICAL_CLASSIFICATION = re.compile(rf"^(.{{2,100}}?) {PAST_CONSIDERED} ((?:the|an?) [\w][\w' -]{{1,95}})$", re.I)
+CURRENT_CLASSIFICATION = re.compile(r"^(.{2,100}?) is (?:currently )?(the [\w][\w' -]{1,95})$", re.I)
+CATEGORY = r"[\w'-]+(?: [\w'-]+){0,6}"
+UNRESOLVED_SUBJECT = re.compile(r"^(?:it|they|he|she|this|that|these|those)\b", re.I)
 HEDGED = re.compile(r"""\b(?:allegedly|rumou?red|unconfirmed|unverified|could|might|hypothetical|pretend|imagine|ignore|system prompt|reportedly|whether|incorrect|false that|misconception|myth|if|unless)\b|[“”"]""", re.I)
 MODEL_INSTRUCTIONS = re.compile(r"\b(?:ignore|override|disregard) (?:all |any |the )?(?:previous|prior|system) instructions\b|\breveal (?:the |your )?system prompt\b", re.I)
 
@@ -34,8 +39,16 @@ def proposition(claim):
     if claim.scope == "current" and (match := LIFECYCLE.fullmatch(text)):
         subject, maintainer = match.groups()
         return Proposition("lifecycle", subject, maintainer=maintainer or "")
+    if claim.scope == "current" and not claim.period and (match := CURRENT_CLASSIFICATION.fullmatch(text)):
+        subject, category = match.groups()
+        if not UNRESOLVED_SUBJECT.match(subject):
+            return Proposition("current_classification", subject, object=category)
     if claim.scope == "stable" and (match := PROVENANCE.fullmatch(text)):
         return Proposition("provenance", *match.groups())
+    if claim.scope == "historical" and not claim.period and (match := HISTORICAL_CLASSIFICATION.fullmatch(text)):
+        subject, category = match.groups()
+        if not UNRESOLVED_SUBJECT.match(subject):
+            return Proposition("historical_classification", subject, object=category)
     if claim.scope == "historical" and claim.anchored and claim.period:
         text = LEADING_PERIOD.sub("", text)
         text = re.sub(r"\s+(?:yesterday|today|last week|recently)$", "", text, flags=re.I)
@@ -47,12 +60,14 @@ def proposition(claim):
 
 def passage_query(claim):
     fact = proposition(claim)
-    if fact is None:
+    if fact is None or fact.kind == "current_classification":
         return None
     if fact.kind == "lifecycle":
         return f"{fact.subject} official support status end of life lifecycle {fact.maintainer}".strip()
     if fact.kind == "provenance":
         return f"{fact.subject} {fact.predicate} by {fact.object} official history"
+    if fact.kind == "historical_classification":
+        return f"{fact.subject} formerly considered {fact.object} historical classification official record"
     return f"{fact.subject} {fact.predicate} {fact.object} {claim.period} official record"
 
 
@@ -139,6 +154,10 @@ def proof(fact, body, url, today, quality):
         return []
     if fact.kind == "lifecycle":
         return lifecycle_proof(fact, body, url, today, quality)
+    if fact.kind == "historical_classification":
+        return historical_classification_proof(fact, body, url, today)
+    if fact.kind == "current_classification":
+        return current_classification_proof(fact, body, url, today) if quality == "official" else []
     subject = re.escape(fact.subject)
     if fact.kind == "provenance":
         statement = re.compile(rf"^{subject} was {fact.predicate} by {re.escape(fact.object)}(?=$|[.,;]| and\b)", re.I)
@@ -156,6 +175,73 @@ def proof(fact, body, url, today, quality):
             return [evidence(url, line, "historical", "supports", period)]
     if fact.predicate == "was released" and fact.object == "from prison":
         return prison_release_proof(subject, body, url, today)
+    return []
+
+
+def historical_classification_proof(fact, body, url, today):
+    subject = re.escape(fact.subject)
+    statement_pattern = re.compile(rf"^{subject} {PAST_CONSIDERED} (?P<label>.+)$", re.I)
+    reclassified = re.compile(rf"\breclassified {subject} as (?:the|an?) {CATEGORY} (?P<when>in {YEAR_PATTERN})$", re.I)
+    category = fact.object.casefold()
+    implied_group_category = "our " + category.removeprefix("the ") if category.startswith("the ") else None
+    rows = []
+    for statement in sentences(body):
+        if not statement.endswith("."):
+            continue
+        past, *transition = re.split(r",\s*but\s+", statement[:-1], maxsplit=1, flags=re.I)
+        period = ""
+        if prefix := LEADING_PERIOD.match(past):
+            if temporal_hint(without_ordinals(prefix[0]), today)[0] != "historical":
+                continue
+            period = date_in(prefix[0], today)
+            past = past[prefix.end():]
+        match = statement_pattern.fullmatch(past)
+        if not match:
+            continue
+        change_period = ""
+        if transition and not re.search(r"\b(?:not|never|proposed|expected|would|may)\b", transition[0], re.I):
+            if change := reclassified.search(transition[0]):
+                change_period = date_in(change["when"], today)
+        label = match["label"].casefold()
+        if label != category and (label != implied_group_category or not change_period):
+            continue
+        timing = period or (f"until reclassification in {change_period}" if change_period else "")
+        rows.append(evidence(url, statement, "historical", "supports", timing))
+    return sorted(rows, key=lambda row: not row["period"])
+
+
+def current_classification_proof(fact, body, url, today):
+    subject = re.escape(fact.subject)
+    old_category = fact.object.casefold()
+    label, _, group = old_category.removeprefix("the ").partition(" in ")
+    former_label = re.escape(old_category)
+    if group.startswith(("our ", "the ")):
+        former_label += rf"|{re.escape(group)}'s {re.escape(label)}"
+    elif not group:
+        former_label += rf"|our (?:{CATEGORY}'s )?{re.escape(label)}"
+    former = re.compile(
+        rf"^{subject} was once (?:{former_label}), but has been reclassified as (?P<new>(?:the|an?) {CATEGORY})\.$", re.I,
+    )
+    passages = list(sentences(body))
+    history = historical_classification_proof(replace(fact, object=f"the {label}"), body, url, today)
+    for statement in passages:
+        if not (transition := former.fullmatch(statement)):
+            continue
+        replacement = re.escape(transition["new"])
+        if transition["new"].casefold() == f"the {label}":
+            continue
+        update = re.compile(rf"\breclassified {subject} as {replacement} in (?P<year>{YEAR_PATTERN})\.$", re.I)
+        current = re.compile(rf"^{subject} is (?:currently )?{replacement}(?: located [^.?!]+)?\.$", re.I)
+        present = next((line for line in passages if current.fullmatch(line)), None)
+        if not present:
+            continue
+        for row in history:
+            if row["period"].startswith("until reclassification in ") and (change := update.search(row["quote"])):
+                return [
+                    evidence(url, statement, "historical", "supports", row["period"]),
+                    evidence(url, row["quote"], "change", "context", change["year"]),
+                    evidence(url, present, "current", "contradicts"),
+                ]
     return []
 
 

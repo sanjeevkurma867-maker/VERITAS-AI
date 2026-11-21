@@ -39,6 +39,99 @@ def fallback(text, sources):
 
 
 class PassageTests(unittest.TestCase):
+    def test_search_verifies_a_dated_reclassification_after_research_quota_failure(self):
+        answer = "Pluto is the ninth planet in our solar system."
+        former = "Pluto was once our solar system's ninth planet, but has been reclassified as a dwarf planet."
+        change = "Pluto was considered the ninth planet, but the IAU reclassified Pluto as a dwarf planet in 2006."
+        current = "Pluto is a dwarf planet."
+        rows = {1: [source(body="\n".join((former, change, current)))]}
+        with (
+            patch.dict(os.environ, ENV, clear=True),
+            patch("backend.verifier.request_research", side_effect=VerificationUnavailable("Plan usage limit.")) as research,
+            patch("backend.verifier.retrieve", return_value=(rows, [])) as search,
+        ):
+            response = TestClient(app).post("/verify", json={"answer": answer})
+        research.assert_called_once()
+        search.assert_called_once()
+        self.assertEqual(response.status_code, 200)
+        report = response.json()
+        self.assertEqual(report["pipeline"], "tavily_search_rules")
+        self.assertEqual(report["summary"]["evidence_coverage"]["assessed"], 1)
+        claim = report["claims"][0]
+        self.assertEqual(claim["status"], "outdated")
+        self.assertEqual(claim["freshness_score"], 0)
+        self.assertTrue(claim["has_transition"])
+        self.assertEqual([item["role"] for item in claim["sources"]], ["historical", "change", "current"])
+        self.assertEqual(claim["sources"][1]["event_period"], "2006")
+
+        for body in (former, change + "\n" + current, former + "\n" + change,
+                     "\n".join((former.replace("solar system", "other system"), change, current))):
+            with self.subTest(body=body):
+                self.assertEqual(fallback(answer, [[source(body=body)]])["claims"][0]["status"], "needs_review")
+
+    def test_reclassification_rule_is_not_tied_to_the_demo_subject(self):
+        answer = "Cedar Hall is the council chamber."
+        page = "\n".join((
+            "Cedar Hall was once the council chamber, but has been reclassified as a public gallery.",
+            "Cedar Hall was considered the council chamber, but the city reclassified Cedar Hall as a public gallery in 2010.",
+            "Cedar Hall is a public gallery.",
+        ))
+        claim = fallback(answer, [[source(body=page)]])["claims"][0]
+        self.assertEqual(claim["status"], "outdated")
+        self.assertEqual(claim["sources"][1]["event_period"], "2010")
+
+    def test_search_verifies_undated_historical_classification_during_research_cooldown(self):
+        historical_claim = "Pluto was considered the ninth planet."
+        answer = historical_claim + "\nThe spacecraft can detect life."
+        page = source(
+            "https://science.nasa.gov/dwarf-planets/pluto/",
+            body="Pluto was long considered our ninth planet, but the International Astronomical Union reclassified Pluto as a dwarf planet in 2006.",
+            title="Pluto Facts",
+        )
+        sources = {1: [page], 2: []}
+        with (
+            patch.dict(os.environ, ENV, clear=True),
+            patch("backend.verifier.request_research", side_effect=VerificationUnavailable("Research is cooling down.")) as research,
+            patch("backend.verifier.retrieve", return_value=(sources, [])),
+        ):
+            response = TestClient(app).post("/verify", json={"answer": answer})
+        research.assert_called_once()
+        self.assertEqual(response.status_code, 200)
+        report = response.json()
+        self.assertEqual(report["pipeline"], "tavily_search_rules")
+        self.assertEqual(report["summary"]["evidence_coverage"]["assessed"], 1)
+        claim = report["claims"][0]
+        self.assertEqual(claim["claim"], historical_claim)
+        self.assertEqual(claim["status"], "historically_correct")
+        self.assertEqual(claim["time_scope"], "historical")
+        self.assertIsNone(claim["freshness_score"])
+        self.assertEqual(claim["sources"][0]["grounding"], "page_passage")
+        self.assertEqual(claim["sources"][0]["event_period"], "until reclassification in 2006")
+
+    def test_historical_classification_requires_matching_page_text_and_scope(self):
+        answer = "Harbor East was considered a hazardous zone."
+        passage = "In 2011, Harbor East was considered a hazardous zone."
+        report = fallback(answer, [[source(body=passage)]])
+        self.assertEqual(report["claims"][0]["status"], "historically_correct")
+        self.assertEqual(report["claims"][0]["sources"][0]["event_period"], "2011")
+        later_report = source(body=(answer[:-1] + ", but the agency reclassified Harbor East as a park, "
+                                    "according to a report published in 2020."))
+        result = fallback(answer, [[later_report]])["claims"][0]
+        self.assertEqual(result["status"], "historically_correct")
+        self.assertIsNone(result["sources"][0]["event_period"])
+
+        for text, row in (
+            (answer, source(snippet=passage)),
+            (answer, source(body=passage, title=passage)),
+            (answer, source(body=passage.replace("East", "West"))),
+            (answer, source(body=passage.replace("was considered", "was not considered"))),
+            (answer, source("https://example.org/history", body=passage)),
+            (answer.replace("was considered", "is considered"), source(body=passage)),
+            ("In 2020, " + answer, source(body=passage)),
+        ):
+            with self.subTest(text=text, row=row):
+                self.assertEqual(fallback(text, [[row]])["claims"][0]["status"], "needs_review")
+
     def test_research_limit_preserves_passage_backed_answers_for_mixed_input(self):
         answer = LIFE + "\n" + HISTORY + "\nThe team has the trophy."
         sources = {
@@ -240,10 +333,23 @@ class ProviderIntegrityTests(unittest.TestCase):
             with self.subTest(status=status), patch("backend.verifier.httpx.Client", return_value=context) as new_client:
                 with self.assertRaisesRegex(VerificationUnavailable, message):
                     request_research(key, claims, TODAY)
-                with self.assertRaisesRegex(VerificationUnavailable, "cooling down"):
+                with self.assertRaisesRegex(VerificationUnavailable, message):
                     request_research(key, claims, TODAY)
                 new_client.assert_called_once()
                 provider.post.assert_called_once()
+
+    def test_research_plan_limit_without_retry_after_stays_paused(self):
+        client = Mock()
+        client.post.return_value = httpx.Response(432, request=httpx.Request("POST", "https://api.tavily.com/research"))
+        context = Mock(__enter__=Mock(return_value=client), __exit__=Mock(return_value=False))
+        claims = extract_candidates(LIFE, TODAY)
+        with patch("backend.verifier.httpx.Client", return_value=context), patch("backend.verifier.monotonic", return_value=0) as clock:
+            with self.assertRaisesRegex(VerificationUnavailable, "plan usage limit"):
+                request_research("no-reset-fixture", claims, TODAY)
+            clock.return_value = 24 * 60 * 60
+            with self.assertRaisesRegex(VerificationUnavailable, "Restart the backend after quota is restored"):
+                request_research("no-reset-fixture", claims, TODAY)
+        client.post.assert_called_once()
 
     def test_bifrost_timeout_surfaces_safe_error(self):
         gateway = BifrostClient("http://127.0.0.1:8080/openai/v1", "fixture")

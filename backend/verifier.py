@@ -21,12 +21,12 @@ from dotenv import load_dotenv
 if __package__:
     from .claims import MAX_ANSWER_LENGTH, MAX_CLAIMS, MONTH_NUMBERS, MONTH_PATTERN, NONCLAIM, SCOPES, WORD, extract_candidates, make_claim, split_compound
     from .inference import EFFECTIVE_EVIDENCE_GUIDANCE, BifrostClient, InferenceUnavailable
-    from .passage_rules import MODEL_INSTRUCTIONS, proof, proposition, tidy, without_ordinals
+    from .passage_rules import MODEL_INSTRUCTIONS, passage_query, proof, proposition, tidy, without_ordinals
     from .tavily_search import SearchUnavailable, retrieve
 else:
     from claims import MAX_ANSWER_LENGTH, MAX_CLAIMS, MONTH_NUMBERS, MONTH_PATTERN, NONCLAIM, SCOPES, WORD, extract_candidates, make_claim, split_compound
     from inference import EFFECTIVE_EVIDENCE_GUIDANCE, BifrostClient, InferenceUnavailable
-    from passage_rules import MODEL_INSTRUCTIONS, proof, proposition, tidy, without_ordinals
+    from passage_rules import MODEL_INSTRUCTIONS, passage_query, proof, proposition, tidy, without_ordinals
     from tavily_search import SearchUnavailable, retrieve
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -40,6 +40,7 @@ RESEARCH_LIMIT_ERRORS = {
     433: "Tavily Research hit the pay-as-you-go limit (HTTP 433).",
     434: "Tavily Research reported a provider limit (HTTP 434).",
 }
+RESEARCH_USAGE_LIMITS = {432, 433}
 ROLES = ("historical", "current", "change")
 RELATIONS = ("supports", "contradicts", "context")
 SUBJECT_RELATIONS = ("same", "narrower", "broader", "different", "unclear")
@@ -212,8 +213,9 @@ clause. Keep numbers and punctuation intact and avoid ellipses or generated para
 def request_research(api_key, claims, today, *, timeout=RESEARCH_TIMEOUT, prior_sources=None):
     namespace = sha256(api_key.encode()).digest()
     with _research_lock:
-        if _research_cooldowns.get(namespace, 0) > monotonic():
-            raise VerificationUnavailable("Tavily Research is cooling down after a request or credit limit.")
+        cooldown = _research_cooldowns.get(namespace)
+        if cooldown and cooldown[0] > monotonic():
+            raise VerificationUnavailable(cooldown[1])
         _research_cooldowns.pop(namespace, None)
     deadline = monotonic() + timeout
     try:
@@ -250,9 +252,19 @@ def request_research(api_key, claims, today, *, timeout=RESEARCH_TIMEOUT, prior_
         elif code in RESEARCH_LIMIT_ERRORS:
             message = RESEARCH_LIMIT_ERRORS[code]
             retry = error.response.headers.get("Retry-After", "")
-            pause = min(900, max(1, int(retry))) if retry.isascii() and retry.isdecimal() and len(retry) <= 8 else 120
+            seconds = int(retry) if retry.isascii() and retry.isdecimal() and len(retry) <= 8 else None
+            if code in RESEARCH_USAGE_LIMITS:
+                pause = max(1, seconds) if seconds is not None else float("inf")
+                blocked = f"{message} " + (
+                    "Research is paused for the provider's retry interval."
+                    if seconds is not None else "Restart the backend after quota is restored to retry Research."
+                )
+            else:
+                pause = min(900, max(1, seconds)) if seconds is not None else 120
+                blocked = f"{message} Research is cooling down."
             with _research_lock:
-                _research_cooldowns[namespace] = monotonic() + pause
+                _research_cooldowns[namespace] = (monotonic() + pause, blocked)
+            message = blocked
         else:
             message = f"Tavily Research returned HTTP {code}."
         raise VerificationUnavailable(message) from None
@@ -1066,7 +1078,7 @@ def verify_at(answer, checked_at):
             warnings.append(str(error))
         except (InferenceUnavailable, VerificationUnavailable) as error:
             warnings.append(str(error))
-    elif research_enabled and all(proposition(claim) for claim in checked_claims):
+    elif research_enabled and all(passage_query(claim) for claim in checked_claims):
         try:
             search_results, search_warnings = measured_search(api_key, checked_claims, today)
             warnings.extend(search_warnings)

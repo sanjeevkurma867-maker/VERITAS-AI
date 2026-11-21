@@ -69,7 +69,7 @@ The stack is FastAPI, Pydantic, HTTPX, React, Vite, Tavily Search, Research and 
 | --- | --- |
 | Tavily Search + Bifrost | The gateway extracts atomic claims and assesses retrieved excerpts. The backend checks structured output, claim-specific source IDs, quoted text, and dates before assigning verdicts. |
 | Tavily Research | Research proposes temporal assessments. Tavily Extract retrieves the cited page text so the backend can verify each decisive quote and check the source roles and effective periods. |
-| Tavily Search + passage checks | Structured checks can resolve eligible lifecycle, dated event, and stable attribution claims from the retrieved page text. Other claims can remain in review. |
+| Tavily Search + passage checks | Retrieved page text can resolve eligible lifecycle, dated event, stable attribution, and classification claims. The classification fallback requires an official page that establishes the earlier category, dated reclassification, and present category before it can return **Outdated**. |
 | Tavily Search · evidence only | Search supplies context when qualifying evidence or reasoning is unavailable. Claims receive **Needs review** and freshness is unavailable. |
 | Recorded example | Source-backed demonstration data exercises the report interface locally. |
 
@@ -85,6 +85,8 @@ The [environment template](backend/.env.example) lists the supported settings.
 | `BIFROST_VIRTUAL_KEY` | Optional gateway virtual key sent as `x-bf-vk`. A configured key also enables the default local URL. |
 | `BIFROST_AUTH_TOKEN` | Separate bearer token when the gateway requires HTTP authentication. |
 | `BIFROST_MODEL` | Defaults to `groq/openai/gpt-oss-120b`. Set this to a model allowed by your gateway. |
+
+When Research returns HTTP 432 or 433, VERITAS AI falls back to Search. It honors a supplied numeric retry interval. Without one, the backend pauses Research for that key until the process restarts. Restart after quota is restored. A temporary HTTP 429 uses a shorter cooldown.
 
 Configure the Groq provider and model in Bifrost, then use a virtual key that grants access to it. A report showing **Tavily Search + Bifrost** with a Groq model confirms that inference returned a structured, excerpt-grounded result. The report discloses fallback on authentication, timeout, or malformed output. The default model follows Groq’s migration guidance for the preferred Llama model. [Groq deprecation guidance](https://console.groq.com/docs/deprecations) [Bifrost virtual-key reference](https://github.com/maximhq/bifrost/blob/dev/docs/features/governance/virtual-keys.mdx)
 
@@ -128,7 +130,9 @@ curl -fsS http://127.0.0.1:8000/verify \
 
 ## Demo and submission
 
-Open **Four claims, four verdicts** for the 105-second recorded walkthrough. It pairs Pluto’s present-day and 2005 classifications with one supported and one contradicted claim about Python’s creation. Walk through **Then**, **Change**, and **Now**, show the IAU citation, and copy the correction. The two-claim API example above is the separate live preview. [Timed script](docs/pitch.md) · [PowerPoint](docs/VERITAS-AI.pptx) · [Hackathon requirement checks](docs/hackathon-compliance.md)
+VERITAS AI was built for the Geek Room hackathon’s PS06 stale-answer detector challenge. The submission notes record the sponsor requirements and the remaining Bifrost check. [Hackathon requirement checks](docs/hackathon-compliance.md)
+
+Open **Four claims, four verdicts** for the 105-second recorded walkthrough. It pairs Pluto’s present-day and 2005 classifications with one supported and one contradicted claim about Python’s creation. Walk through **Then**, **Change**, and **Now**, show the IAU citation, and copy the correction. The two-claim API example above is the separate live preview. [Timed script](docs/pitch.md) · [PowerPoint](docs/VERITAS-AI.pptx)
 
 ## Tests and limitations
 
@@ -141,8 +145,8 @@ Tests cover all five verdicts, compound extraction, exact dates, organization ve
 
 | Local integration check | Result |
 | --- | --- |
-| Tavily Search | Returned page-backed **Outdated** and **Historically correct** verdicts in a two-claim test with Research disabled. |
-| Tavily Research and Extract | The current Research probe returned a request or credit limit. The earlier release reached live Research. The current quote-checking path using Extract passed simulated provider tests. |
+| Tavily Search | With Research disabled, the live claim “Pluto is the ninth planet in our solar system” returned **Outdated**, 1/1 coverage, and the three cited timeline steps. Earlier live checks also resolved undated historical classification, software lifecycle, and historical event claims. |
+| Tavily Research and Extract | The reported Research failure was HTTP 432, the plan usage limit. This pass used mocked Research and Extract responses for quota handling and citation checks. |
 | Bifrost → Groq | Local gateway health returned 200. Protected management and earlier inference returned HTTP 401. The backend needs an authorized inference key for a live Groq check. |
 
 - Live reasoning depends on provider access, source quality, and latency. Passage rules cover a limited set of patterns. General claims may need Research or authenticated Bifrost.
