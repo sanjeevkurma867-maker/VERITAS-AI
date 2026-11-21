@@ -1,24 +1,32 @@
 import json
+import logging
 import os
 import re
 from collections import Counter
+from dataclasses import replace
 from datetime import date, datetime, timezone
+from contextvars import ContextVar
+from functools import wraps
+from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
+from threading import Lock
 from time import monotonic, sleep
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import UUID
 
 import httpx
 from dotenv import load_dotenv
 
 if __package__:
-    from .claims import MAX_ANSWER_LENGTH, MAX_CLAIMS, NONCLAIM, SCOPES, WORD, extract_candidates, make_claim, split_compound
+    from .claims import MAX_ANSWER_LENGTH, MAX_CLAIMS, MONTH_NUMBERS, MONTH_PATTERN, NONCLAIM, SCOPES, WORD, extract_candidates, make_claim, split_compound
     from .inference import EFFECTIVE_EVIDENCE_GUIDANCE, BifrostClient, InferenceUnavailable
+    from .passage_rules import MODEL_INSTRUCTIONS, proof, proposition, tidy, without_ordinals
     from .tavily_search import SearchUnavailable, retrieve
 else:
-    from claims import MAX_ANSWER_LENGTH, MAX_CLAIMS, NONCLAIM, SCOPES, WORD, extract_candidates, make_claim, split_compound
+    from claims import MAX_ANSWER_LENGTH, MAX_CLAIMS, MONTH_NUMBERS, MONTH_PATTERN, NONCLAIM, SCOPES, WORD, extract_candidates, make_claim, split_compound
     from inference import EFFECTIVE_EVIDENCE_GUIDANCE, BifrostClient, InferenceUnavailable
+    from passage_rules import MODEL_INSTRUCTIONS, proof, proposition, tidy, without_ordinals
     from tavily_search import SearchUnavailable, retrieve
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -33,6 +41,8 @@ SUBJECT_QUANTIFIERS = ("exact", "existence", "absence")
 CITATION = re.compile(r"\s*\[\d+\](?:\(https?://[^\s)]+\))?")
 YEAR = re.compile(r"\b(?:1\d{3}|20\d{2}|2100)\b")
 ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+MONTH_FIRST_DATE = re.compile(rf"\b({MONTH_PATTERN})\.?\s+(\d{{1,2}}),?\s+(\d{{4}})\b", re.I)
+DAY_FIRST_DATE = re.compile(rf"\b(\d{{1,2}})\s+({MONTH_PATTERN})\.?\s+(\d{{4}})\b", re.I)
 OPEN_PERIOD = re.compile(r"\b(?:since|present|today|ongoing|onward)\b", re.I)
 VERDICTS = ("current", "historically_correct", "outdated", "contradicted", "needs_review")
 OFFICIAL_DOMAINS = {"iau.org", "python.org", "royal.uk", "ec.europa.eu", "un.org", "who.int", "w3.org"}
@@ -43,6 +53,25 @@ REFERENCE_DOMAINS = {
 }
 CORRECTION_STOP = set("a an the and or as at by for from in is are of on to with was were now currently officially classified reclassified".split())
 SOURCE_PRIORITY = {"official": 0, "institutional": 1, "reference": 2, "other": 3}
+TIMINGS = ContextVar("verification_timings", default=None)
+LOGGER = logging.getLogger("uvicorn.error")
+_research_cooldowns = {}
+_research_lock = Lock()
+
+
+def timed(label):
+    def decorate(function):
+        @wraps(function)
+        def measured(*args, **kwargs):
+            timings = TIMINGS.get()
+            start = monotonic()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                if timings is not None:
+                    timings[label] = timings.get(label, 0) + (monotonic() - start) * 1000
+        return measured
+    return decorate
 
 EVIDENCE_FIELDS = {
     "url": {"type": "string", "description": "Exact URL from the cited sources."},
@@ -51,6 +80,7 @@ EVIDENCE_FIELDS = {
     "subject_relation": {"type": "string", "enum": list(SUBJECT_RELATIONS), "description": "How the cited fact's entity and qualifiers compare to the exact subject of the claim."},
     "period": {"type": "string", "description": "Effective event date, period, or an empty string."},
     "summary": {"type": "string", "description": "Brief paraphrase of the relevant evidence."},
+    "quote": {"type": "string", "description": "Exact contiguous passage from the cited page that establishes the stated relation. Use an empty string if unavailable."},
 }
 ASSESSMENT_FIELDS = {
     "id": {"type": "integer", "description": "ID of the claim in the input."},
@@ -58,6 +88,7 @@ ASSESSMENT_FIELDS = {
     "subject_quantifier": {"type": "string", "enum": list(SUBJECT_QUANTIFIERS), "description": "Whether the claim asserts none, at least one, or a specific fact or count."},
     "period": {"type": "string", "description": "Date or period asserted by the claim, if known."},
     "explanation": {"type": "string", "description": "Why the evidence applies or what remains uncertain."},
+    "interpretation": {"type": "string", "description": "The conventional definition or explicit interpretation used to decide the claim, if needed."},
     "updated_claim": {"type": "string", "description": "Evidence-backed replacement for an outdated claim, or an empty string."},
     "correction_url": {"type": "string", "description": "Exact current evidence URL that establishes the replacement, or an empty string."},
     "evidence": {
@@ -164,11 +195,20 @@ to that current source's URL so the wording can be checked.
 Use empty correction fields when unavailable.
 If sources conflict or scope is unresolved, describe the uncertainty in the explanation.
 Never infer support or contradiction from a search result title alone.
+For every evidence item include an exact contiguous supporting passage copied from its source.
+The verifier will check these passages against extracted page text. Use a verbatim sentence or
+clause. Keep numbers and punctuation intact and avoid ellipses or generated paraphrases in quote.
 
 {followup}Claims: {json.dumps(numbered, ensure_ascii=False)}"""
 
 
+@timed("tavily_research")
 def request_research(api_key, claims, today, *, timeout=RESEARCH_TIMEOUT, prior_sources=None):
+    namespace = sha256(api_key.encode()).digest()
+    with _research_lock:
+        if _research_cooldowns.get(namespace, 0) > monotonic():
+            raise VerificationUnavailable("Tavily Research is cooling down after a request or credit limit.")
+        _research_cooldowns.pop(namespace, None)
     deadline = monotonic() + timeout
     try:
         with httpx.Client(
@@ -191,7 +231,7 @@ def request_research(api_key, claims, today, *, timeout=RESEARCH_TIMEOUT, prior_
                 if not isinstance(report, dict):
                     raise VerificationUnavailable("Tavily Research returned an invalid result.")
                 if report.get("status") == "completed":
-                    return report
+                    return ground_research(report, client, deadline)
                 if report.get("status") not in {"pending", "in_progress", "processing", "queued"}:
                     raise VerificationUnavailable("The evidence provider could not finish this report.")
                 sleep(min(2, max(0, deadline - monotonic())))
@@ -203,6 +243,10 @@ def request_research(api_key, claims, today, *, timeout=RESEARCH_TIMEOUT, prior_
             message = "Tavily Research rejected its credentials or access."
         elif code in {429, 432, 433, 434}:
             message = "Tavily Research reached a request or credit limit."
+            retry = error.response.headers.get("Retry-After", "")
+            pause = min(900, max(1, int(retry))) if retry.isascii() and retry.isdecimal() and len(retry) <= 8 else 120
+            with _research_lock:
+                _research_cooldowns[namespace] = monotonic() + pause
         else:
             message = f"Tavily Research returned HTTP {code}."
         raise VerificationUnavailable(message) from None
@@ -219,6 +263,35 @@ def normalized(value):
     return " ".join(value.split())
 
 
+def period_grounded(period, quote):
+    if not set(YEAR.findall(period)) <= set(YEAR.findall(quote)):
+        return False
+    dates = set(ISO_DATE.findall(period))
+    if not dates:
+        return True
+    passage = without_ordinals(quote)
+    quoted_dates = set()
+    for point in ISO_DATE.findall(passage):
+        try:
+            quoted_dates.add(date.fromisoformat(point).isoformat())
+        except ValueError:
+            continue
+    written_dates = MONTH_FIRST_DATE.findall(passage)
+    written_dates.extend((month, day, year) for day, month, year in DAY_FIRST_DATE.findall(passage))
+    for month, day, year in written_dates:
+        try:
+            quoted_dates.add(date(int(year), MONTH_NUMBERS[month[:3].lower()], int(day)).isoformat())
+        except ValueError:
+            continue
+    return dates <= quoted_dates
+
+
+def matched_passage(quote, body, title):
+    passage = tidy(quote)
+    return (len(passage) >= 12 and passage in body
+            and passage.rstrip(".!?").casefold() != tidy(title).rstrip(".!?").casefold())
+
+
 def source_key(url):
     try:
         if any(character.isspace() or ord(character) < 32 for character in url) or "\\" in url:
@@ -233,7 +306,11 @@ def source_key(url):
         except ValueError:
             if not re.search(r"\.[a-z][a-z0-9-]*\.?$", host) or host.rstrip(".").endswith((".local", ".internal", ".localhost", ".test", ".invalid")):
                 return None
-        return (host.removeprefix("www."), parts.port, parts.path.rstrip("/"), parts.query)
+        query = urlencode(sorted((name, value) for name, value in parse_qsl(parts.query, keep_blank_values=True)
+                                 if not name.lower().startswith("utm_") and name.lower() not in {"fbclid", "gclid"}))
+        default_port = 443 if parts.scheme == "https" else 80
+        return (host.rstrip(".").removeprefix("www."), None if parts.port == default_port else parts.port,
+                parts.path.rstrip("/"), query)
     except ValueError:
         return None
 
@@ -270,9 +347,83 @@ def source_index(items):
             "domain": key[0],
             "quality": source_quality(key[0]),
             "published_date": clean_text(item.get("published_date"), 80) or None,
+            "retrieved_at": clean_text(item.get("_retrieved_at"), 80) or None,
+            "cached": item.get("_cached") is True,
             "excerpt": clean_text(item.get("content"), 2000) or None,
         })
     return sources
+
+
+@timed("tavily_extract_validation")
+def ground_research(report, client, deadline):
+    content = report.get("content")
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return report
+    if not isinstance(content, dict) or not isinstance(content.get("assessments"), list):
+        return report
+    known = source_index(report.get("sources"))
+    evidence = [
+        item for assessment in content["assessments"] if isinstance(assessment, dict) and isinstance(assessment.get("evidence"), list)
+        for item in assessment["evidence"] if isinstance(item, dict)
+    ]
+    candidates = {}
+    for item in evidence:
+        key = source_key(clean_text(item.get("url"), 2000))
+        if key in known and len(clean_text(item.get("quote"), 550)) >= 12:
+            candidates.setdefault(key, known[key])
+    priority = sorted(candidates, key=lambda key: SOURCE_PRIORITY[candidates[key]["quality"]])[:20]
+    extracted = {}
+    remaining = min(8, deadline - monotonic())
+    if priority and remaining >= 1:
+        try:
+            response = client.post("/extract", json={"urls": [known[key]["url"] for key in priority],
+                                                     "format": "text", "extract_depth": "basic",
+                                                     "include_published_date": True}, timeout=remaining)
+            response.raise_for_status()
+            data = response.json().get("results", [])
+            for row in data if isinstance(data, list) else []:
+                if not isinstance(row, dict) or not isinstance(row.get("raw_content"), str) or MODEL_INSTRUCTIONS.search(row["raw_content"]):
+                    continue
+                key = source_key(clean_text(row.get("url"), 2000))
+                if key in candidates:
+                    extracted[key] = (tidy(row["raw_content"][:150000]), row)
+        except (httpx.HTTPError, ValueError, AttributeError):
+            pass
+
+    unconfirmed = False
+    unconfirmed_period = False
+    stamp = datetime.now(timezone.utc).isoformat()
+    for item in evidence:
+        key = source_key(clean_text(item.get("url"), 2000))
+        quote = clean_text(item.get("quote"), 550)
+        if key in extracted and matched_passage(quote, extracted[key][0], known[key]["title"]):
+            item["grounding"] = "page_passage"
+            if not period_grounded(clean_text(item.get("period"), 100), quote):
+                unconfirmed_period = True
+                item.update(relation="context", period="")
+            continue
+        unconfirmed = True
+        item.update(relation="context", quote="", grounding="retrieved_only")
+
+    for source in report["sources"] if isinstance(report.get("sources"), list) else []:
+        if not isinstance(source, dict):
+            continue
+        key = source_key(clean_text(source.get("url"), 2000))
+        if key in extracted:
+            source["_retrieved_at"] = stamp
+            if extracted[key][1].get("published_date"):
+                source["published_date"] = extracted[key][1]["published_date"]
+    report["content"] = content
+    if unconfirmed or unconfirmed_period:
+        report["validation_warnings"] = []
+        if unconfirmed:
+            report["validation_warnings"].append("Some Tavily Research citations remained contextual because their quoted passages could not be matched to extracted page text.")
+        if unconfirmed_period:
+            report["validation_warnings"].append("Some Tavily Research citations remained contextual because their stated dates did not match the quoted passages.")
+    return report
 
 
 def period_covers(anchor, period):
@@ -314,6 +465,7 @@ def applies_to_subject(subject_relation, quantifier, relation):
     }
 
 
+@timed("evidence_validation")
 def collect_evidence(items, known_sources, quantifier):
     evidence = []
     seen = set()
@@ -343,6 +495,7 @@ def collect_evidence(items, known_sources, quantifier):
             "role": role,
             "relation": relation,
             "subject_relation": subject_relation,
+            "grounding": item["grounding"] if item.get("grounding") in ("page_passage", "retrieved_only") else "attributed",
             "event_period": period or None,
             "snippet": snippet,
         })
@@ -350,10 +503,11 @@ def collect_evidence(items, known_sources, quantifier):
 
 
 def sufficient(items):
-    return (
-        any(item["quality"] != "other" for item in items)
-        or len({source_group(item["domain"]) for item in items}) >= 2
-    )
+    independent = {}
+    for item in items:
+        passage = normalized(item.get("excerpt") or item["snippet"]).casefold()
+        independent.setdefault(passage, source_group(item["domain"]))
+    return any(item["quality"] != "other" for item in items) or len(set(independent.values())) >= 2
 
 
 def closed_before(period, today):
@@ -375,7 +529,8 @@ def event_occurred_by(period, cutoff):
     return bool(upper_bounds) and max(upper_bounds) <= cutoff
 
 
-def classify(scope, evidence, period="", cumulative_cutoff=None):
+@timed("verdict")
+def classify(scope, evidence, period="", cumulative_cutoff=None, recent_event=False):
     if scope in {"future", "unclear"}:
         return "needs_review", None
 
@@ -385,6 +540,7 @@ def classify(scope, evidence, period="", cumulative_cutoff=None):
             scope != "historical"
             or period_covers(period, item["event_period"])
             or (cumulative_cutoff and item["relation"] == "contradicts" and event_occurred_by(item["event_period"], cumulative_cutoff))
+            or (recent_event and event_within_window(item["event_period"], period))
         )
     ]
     current = [item for item in evidence if item["role"] == "current"]
@@ -432,6 +588,13 @@ def classify(scope, evidence, period="", cumulative_cutoff=None):
     return "needs_review", "Cited evidence could not establish a verdict for the period this claim describes."
 
 
+def event_within_window(evidence_period, claim_period):
+    window = ISO_DATE.findall(claim_period)
+    return bool(len(window) == 2 and evidence_period and ISO_DATE.fullmatch(evidence_period)
+                and window[0] <= evidence_period <= window[1])
+
+
+@timed("correction")
 def correction_for(item, evidence):
     replacement = clean_text(item.get("updated_claim"), 600)
     if not replacement:
@@ -446,7 +609,7 @@ def correction_for(item, evidence):
                 continue
             basis = item["correction_quote"]
         else:
-            basis = source["snippet"]
+            basis = source["excerpt"] if source["grounding"] == "page_passage" else source["snippet"]
         if isinstance(basis, str):
             grounded.append((source, correction_words(basis)))
 
@@ -495,6 +658,8 @@ def summarize(results):
 
 
 def report_payload(results, checked_at, *, omitted_claims, mode, pipeline, warnings, model):
+    summary = summarize(results)
+    coverage = summary["evidence_coverage"]
     return {
         "project": "VERITAS AI",
         "mode": mode,
@@ -504,9 +669,15 @@ def report_payload(results, checked_at, *, omitted_claims, mode, pipeline, warni
         "total_claims": len(results),
         "omitted_claims": omitted_claims,
         "warnings": list(dict.fromkeys(warnings)),
-        "summary": summarize(results),
+        "summary": summary,
+        "verification": completeness(coverage),
+        "timings_ms": {},
         "claims": results,
     }
+
+
+def completeness(coverage):
+    return "complete" if coverage["assessed"] == coverage["total"] else "partial" if coverage["assessed"] else "evidence_only"
 
 
 def build_report(
@@ -556,16 +727,19 @@ def build_report(
             cutoff[0] if cutoff and quantifier == "absence" and re.search(r"\bnever\b", claim.text, re.I)
             and re.match(r"\s*(?:as of|by)\b", claim.text, re.I) else None
         )
-        status, gap = classify(scope, evidence, period, cumulative_cutoff)
+        status, gap = classify(scope, evidence, period, cumulative_cutoff, claim.recent_event)
         explanation = gap or clean_text(item.get("explanation"))
         correction, correction_url = correction_for(item, evidence) if status == "outdated" else (None, None)
 
-        changes = [source for source in evidence if source["role"] == "change" and source["subject_relation"] == "same" and YEAR.search(source["event_period"] or "")]
+        changes = [source for source in evidence if source["role"] == "change" and source["subject_relation"] == "same"
+                   and source["grounding"] != "retrieved_only" and YEAR.search(source["event_period"] or "")]
         has_transition = status == "outdated" and sufficient(changes)
         results.append({
             "claim": claim.text,
             "status": status,
             "time_scope": scope,
+            "recent_event": claim.recent_event,
+            "interpretation": clean_text(item.get("interpretation"), 300) or None,
             "subject_quantifier": quantifier,
             "claim_period": period or None,
             "freshness_score": {"current": 100, "outdated": 0}.get(status) if scope == "current" else None,
@@ -576,9 +750,11 @@ def build_report(
             "sources": evidence,
         })
 
-    return report_payload(results, checked_at, omitted_claims=omitted_claims, mode=mode, pipeline=pipeline, warnings=warnings, model=model)
+    return report_payload(results, checked_at, omitted_claims=omitted_claims, mode=mode, pipeline=pipeline,
+                          warnings=[*warnings, *research.get("validation_warnings", [])], model=model)
 
 
+@timed("bifrost_extraction")
 def gateway_claims(gateway, answer, today):
     extraction = gateway.extract(answer, today)
     original = normalized(answer)
@@ -586,7 +762,7 @@ def gateway_claims(gateway, answer, today):
     claims = {}
     for item in extraction.claims:
         wording, quote = normalized(item.text), normalized(item.quote)
-        if quote not in original or NONCLAIM.match(quote) or NONCLAIM.match(wording) or wording.endswith("?"):
+        if len(quote) < 3 or quote not in original or NONCLAIM.match(quote) or NONCLAIM.match(wording) or wording.endswith("?"):
             raise InferenceUnavailable("Bifrost could not anchor an extracted claim to the input.")
         if set(WORD.findall(wording.casefold())) - original_words:
             raise InferenceUnavailable("Bifrost returned extracted wording absent from the input.")
@@ -597,12 +773,27 @@ def gateway_claims(gateway, answer, today):
     return list(claims.values())
 
 
+@timed("bifrost_evidence_reasoning")
 def gateway_report(gateway, claims, search_results, today):
     raw_sources = []
     payload = []
     id_maps = {}
     for index, claim in enumerate(claims, 1):
-        matches = [source for source in source_index(search_results[index]).values() if source["excerpt"]]
+        records = search_results[index]
+        sources = source_index(records)
+        bodies = {
+            source_key(clean_text(item.get("url"), 2000)): item["raw_content"]
+            for item in records if isinstance(item.get("raw_content"), str) and item["raw_content"].strip()
+        }
+        terms = {word for word in WORD.findall(claim.text.casefold()) if len(word) >= 4}
+        matches = []
+        for key, source in sources.items():
+            body = bodies.get(key, "")
+            if not body or MODEL_INSTRUCTIONS.search(body):
+                continue
+            windows = (body[offset:offset + 1900] for offset in range(0, len(body), 1400))
+            passage = max(windows, key=lambda chunk: len(terms & set(WORD.findall(chunk.casefold()))))
+            matches.append({**source, "excerpt": tidy(passage)})
         id_maps[index] = {f"{index}.{number}": source for number, source in enumerate(matches, 1)}
         raw_sources.extend(search_results[index])
         payload.append({
@@ -626,15 +817,18 @@ def gateway_report(gateway, claims, search_results, today):
         evidence = []
         for reference in item.evidence:
             source = matches.get(reference.source_id)
-            if not source or normalized(reference.quote) not in normalized(source["excerpt"]):
+            if not source or not matched_passage(reference.quote, source["excerpt"], source["title"]):
                 continue
-            period = reference.period if set(YEAR.findall(reference.period)) <= set(YEAR.findall(reference.quote)) else ""
-            evidence.append({**reference.model_dump(), "url": source["url"], "period": period})
-            grounded_count += 1
+            entry = {**reference.model_dump(), "url": source["url"], "grounding": "page_passage"}
+            if period_grounded(reference.period, reference.quote):
+                grounded_count += 1
+            else:
+                entry.update(relation="context", period="")
+            evidence.append(entry)
         correction = matches.get(item.correction_source_id)
-        quote = normalized(item.correction_quote)
+        quote = tidy(item.correction_quote)
         correction_url = ""
-        if correction and len(quote) >= 12 and quote in normalized(correction["excerpt"]):
+        if correction and matched_passage(quote, correction["excerpt"], correction["title"]):
             correction_url = correction["url"]
         assessments.append({**item.model_dump(), "evidence": evidence, "correction_url": correction_url})
     if not grounded_count:
@@ -642,30 +836,72 @@ def gateway_report(gateway, claims, search_results, today):
     return {"sources": raw_sources, "content": {"assessments": assessments}}
 
 
+@timed("passage_rules")
 def search_only_report(claims, search_results, checked_at, omitted, warnings):
+    evidence_results = []
     results = []
     for index, claim in enumerate(claims, 1):
-        sources = source_index(search_results[index]).values()
+        retrieved = search_results[index]
+        sources = source_index(retrieved)
+        fact = proposition(claim)
+        if fact:
+            passages = []
+            policy = []
+            seen = set()
+            for item in retrieved:
+                key = source_key(clean_text(item.get("url"), 2000))
+                source = sources.get(key)
+                if source and key not in seen and item.get("raw_content"):
+                    raw_content = item["raw_content"]
+                    exact = proof(fact, raw_content, source["url"], checked_at.date(), source["quality"])
+                    passages.extend(rows_beyond_headline(exact, source["title"]))
+                    if fact.kind == "lifecycle" and fact.maintainer and not exact:
+                        candidate = proof(replace(fact, maintainer=""), raw_content, source["url"], checked_at.date(), source["quality"])
+                        candidate = rows_beyond_headline(candidate, source["title"])
+                        if candidate:
+                            policy.append((source_group(source["domain"]), candidate))
+                    seen.add(key)
+            attribution_groups = {source_group(source_key(row["url"])[0]) for row in passages}
+            for group, candidate in policy:
+                if attribution_groups - {group}:
+                    passages.extend(candidate)
+            if passages:
+                assessment = {
+                    "id": 1, "scope": claim.scope, "period": claim.period,
+                    "explanation": "The cited page passages directly establish the relevant fact and period.",
+                    "evidence": passages,
+                }
+                if fact.kind == "lifecycle":
+                    assessment["updated_claim"] = f"{fact.subject} is no longer officially supported."
+                raw = {"sources": retrieved, "content": {"assessments": [assessment]}}
+                verdict = build_report([claim], raw, checked_at)["claims"][0]
+                if verdict["status"] != "needs_review":
+                    evidence_results.append(verdict)
+                    results.append(verdict)
+                    continue
         evidence = [
             {
                 **source,
                 "role": "retrieved",
                 "relation": "context",
                 "subject_relation": "unclear",
+                "grounding": "retrieved_only",
                 "event_period": None,
                 "snippet": source["excerpt"] or "Tavily returned a link without an excerpt.",
             }
-            for source in sources
+            for source in sources.values()
         ]
         results.append({
             "claim": claim.text,
             "status": "needs_review",
             "time_scope": claim.scope,
+            "recent_event": claim.recent_event,
+            "interpretation": None,
             "subject_quantifier": None,
             "claim_period": claim.period or None,
             "freshness_score": None,
             "explanation": (
-                "Tavily Search found these sources. A reasoning service is needed to assess their relevance to this claim’s time frame."
+                "Tavily Search found these sources. The available passage checks could not establish a verdict for this claim."
                 if evidence else "Tavily Search did not retrieve sources for this claim."
             ),
             "updated_claim": None,
@@ -673,7 +909,13 @@ def search_only_report(claims, search_results, checked_at, omitted, warnings):
             "has_transition": False,
             "sources": evidence,
         })
-    return report_payload(results, checked_at, omitted_claims=omitted, mode="live", pipeline="tavily_search", warnings=warnings, model=None)
+    pipeline = "tavily_search_rules" if evidence_results else "tavily_search"
+    return report_payload(results, checked_at, omitted_claims=omitted, mode="live", pipeline=pipeline, warnings=warnings, model=None)
+
+
+def rows_beyond_headline(rows, headline):
+    title = tidy(headline).rstrip(".!?").casefold()
+    return [row for row in rows if tidy(row["quote"]).rstrip(".!?").casefold() != title]
 
 
 def evidence_disagrees(sources):
@@ -724,7 +966,7 @@ def recheck_corroboration(api_key, claims, today, report, deadline):
     selected = [claims[index] for index, _ in targets]
     try:
         response = request_research(api_key, selected, today, timeout=timeout, prior_sources=prior_sources)
-        followup = build_report(selected, response, datetime.now(timezone.utc))
+        followup = build_report(selected, response, datetime.fromisoformat(report["checked_at"]))
     except VerificationUnavailable:
         report["warnings"].append("Tavily Research could not complete the evidence follow-up.")
         return report
@@ -746,13 +988,35 @@ def recheck_corroboration(api_key, claims, today, report, deadline):
             continue
         report["claims"][index] = updated
     report["summary"] = summarize(report["claims"])
+    report["verification"] = completeness(report["summary"]["evidence_coverage"])
     return report
 
 
 def verify_answer(answer):
+    measured = {}
+    token = TIMINGS.set(measured)
+    started = monotonic()
+    report = None
+    try:
+        report = verify_at(answer, datetime.now(timezone.utc))
+        return report
+    finally:
+        measured["total"] = (monotonic() - started) * 1000
+        milliseconds = {key: round(value, 1) for key, value in measured.items()}
+        TIMINGS.reset(token)
+        if report is not None:
+            report["timings_ms"] = milliseconds
+        LOGGER.info("verification %s", json.dumps({
+            "pipeline": report["pipeline"] if report else None,
+            "claims": report["total_claims"] if report else 0,
+            "timings_ms": milliseconds,
+        }))
+
+
+def verify_at(answer, checked_at):
     deadline = monotonic() + VERIFICATION_BUDGET
-    today = date.today()
-    claims = extract_candidates(answer, today)
+    today = checked_at.date()
+    claims = timed("extraction_and_temporal_scope")(extract_candidates)(answer, today)
     api_key = os.getenv("TAVILY_API_KEY")
     gateway = BifrostClient.from_environment()
     warnings = []
@@ -775,13 +1039,16 @@ def verify_answer(answer):
     omitted = len(claims) - len(checked_claims)
     search_results = None
     search_error = None
+    research_enabled = os.getenv("TAVILY_RESEARCH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+    measured_search = timed("tavily_search")(retrieve)
+    fast_report = None
     if gateway:
         try:
-            search_results, search_warnings = retrieve(api_key, checked_claims, today)
+            search_results, search_warnings = measured_search(api_key, checked_claims, today)
             warnings.extend(search_warnings)
             response = gateway_report(gateway, checked_claims, search_results, today)
             return build_report(
-                checked_claims, response, datetime.now(timezone.utc),
+                checked_claims, response, checked_at,
                 omitted_claims=omitted, pipeline="bifrost", warnings=warnings, model=gateway.model,
             )
         except SearchUnavailable as error:
@@ -789,30 +1056,46 @@ def verify_answer(answer):
             warnings.append(str(error))
         except (InferenceUnavailable, VerificationUnavailable) as error:
             warnings.append(str(error))
+    elif research_enabled and all(proposition(claim) for claim in checked_claims):
+        try:
+            search_results, search_warnings = measured_search(api_key, checked_claims, today)
+            warnings.extend(search_warnings)
+            fast_report = search_only_report(checked_claims, search_results, checked_at, omitted, warnings)
+            if fast_report["verification"] == "complete":
+                return fast_report
+        except SearchUnavailable as error:
+            search_error = error
+            warnings.append(str(error))
 
     research_error = None
-    if os.getenv("TAVILY_RESEARCH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}:
+    if research_enabled:
         try:
             response = request_research(api_key, checked_claims, today)
             report = build_report(
-                checked_claims, response, datetime.now(timezone.utc),
+                checked_claims, response, checked_at,
                 omitted_claims=omitted, warnings=warnings,
             )
+            if report["verification"] == "evidence_only" and response.get("validation_warnings"):
+                if fast_report is None or fast_report["verification"] != "evidence_only":
+                    raise VerificationUnavailable("Tavily Research did not supply a verifiable cited verdict. Checking retrieved passages instead.")
             return recheck_corroboration(api_key, checked_claims, today, report, deadline)
         except VerificationUnavailable as error:
             research_error = error
             warnings.append(str(error))
     else:
-        warnings.append("Tavily Research is disabled. Tavily Search can supply evidence for manual review.")
+        warnings.append("Tavily Research is disabled. Tavily Search passage checks may resolve a subset of claims.")
 
+    if fast_report is not None:
+        fast_report["warnings"] = list(dict.fromkeys(warnings))
+        return fast_report
     if search_results is None and search_error is None:
         try:
-            search_results, search_warnings = retrieve(api_key, checked_claims, today)
+            search_results, search_warnings = measured_search(api_key, checked_claims, today)
             warnings.extend(search_warnings)
         except SearchUnavailable as error:
             search_error = error
     if search_results is not None:
-        return search_only_report(checked_claims, search_results, datetime.now(timezone.utc), omitted, warnings)
+        return search_only_report(checked_claims, search_results, checked_at, omitted, warnings)
 
     reason = f"{research_error} {search_error}" if research_error else str(search_error)
     error_type = VerificationTimeout if isinstance(research_error, VerificationTimeout) else VerificationUnavailable

@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 SCOPES = ("current", "historical", "stable", "future", "unclear")
 MAX_CLAIMS = 5
@@ -34,6 +34,8 @@ NONCLAIM = re.compile(
 )
 QUESTION_START = re.compile(r"^\s*(?:is|are|was|were|does|did|could|would|can|what|why|how|where|which)\s+", re.IGNORECASE)
 WORD = re.compile(r"[\w]+(?:['’-][\w]+)*", re.UNICODE)
+RECENT = re.compile(r"\b(yesterday|(?:in |over )?the last (?:week|7 days)|last week|recently|today)\b", re.I)
+EVENT_VERB = re.compile(r"\b(?:happened|occurred|discovered|announced|released|launched|opened|signed|ratified|won|died|landed|became)\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,24 @@ class Claim:
     period: str = ""
     topic: str = ""
     anchored: bool = False
+    recent_event: bool = False
+
+
+def relative_window(text, today):
+    parts = {item.group(0).casefold() for item in RECENT.finditer(text)}
+    if len(parts) != 1:
+        return None
+    term = next(iter(parts))
+    if term == "yesterday":
+        return (today - timedelta(days=1)).isoformat()
+    if term == "last week":
+        monday = today - timedelta(days=today.weekday() + 7)
+        return f"{monday.isoformat()} to {(monday + timedelta(days=6)).isoformat()}"
+    if term == "recently":
+        return f"{(today - timedelta(days=29)).isoformat()} to {today.isoformat()}"
+    if term == "today":
+        return today.isoformat()
+    return f"{(today - timedelta(days=7)).isoformat()} to {(today - timedelta(days=1)).isoformat()}"
 
 
 def temporal_hint(text, today):
@@ -78,6 +98,11 @@ def temporal_hint(text, today):
         return "historical", str(today.year - 1), True
     if re.search(r"\b(?:next year|next month|next week|will be|will become)\b", text, re.IGNORECASE):
         return "future", "", True
+    window = relative_window(text, today)
+    if window and (window != today.isoformat() or EVENT_VERB.search(text)):
+        if " to " in window and not EVENT_VERB.search(text):
+            return "unclear", window, True
+        return "historical", window, True
     since = SINCE_ANCHOR.search(text)
     if since:
         return "current", f"since {since[1]}", True
@@ -129,6 +154,7 @@ def make_claim(text, today, *, scope="unclear", period="", topic=""):
         period=hinted_period or period,
         topic=topic,
         anchored=anchored,
+        recent_event=bool(hint == "historical" and EVENT_VERB.search(text) and relative_window(text, today) == hinted_period),
     )
 
 

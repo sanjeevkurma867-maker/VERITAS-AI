@@ -3,7 +3,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 Verdict = Literal["current", "historically_correct", "outdated", "contradicted", "needs_review"]
-Pipeline = Literal["bifrost", "tavily_research", "tavily_search", "recorded"]
+Pipeline = Literal["bifrost", "tavily_research", "tavily_search", "tavily_search_rules", "recorded"]
 
 
 class Citation(BaseModel):
@@ -12,10 +12,13 @@ class Citation(BaseModel):
     domain: str
     quality: Literal["official", "institutional", "reference", "other"]
     published_date: str | None
+    retrieved_at: str | None
+    cached: bool
     event_period: str | None
     role: Literal["historical", "change", "current", "retrieved"]
     relation: Literal["supports", "contradicts", "context"]
     subject_relation: Literal["same", "narrower", "broader", "different", "unclear"]
+    grounding: Literal["page_passage", "attributed", "retrieved_only"]
     snippet: str
     excerpt: str | None
 
@@ -25,6 +28,8 @@ class ClaimReport(BaseModel):
     status: Verdict
     time_scope: Literal["current", "historical", "stable", "future", "unclear"]
     subject_quantifier: Literal["exact", "existence", "absence"] | None
+    recent_event: bool
+    interpretation: str | None
     claim_period: str | None
     freshness_score: Literal[0, 100] | None
     explanation: str
@@ -63,6 +68,8 @@ class VerifyResponse(BaseModel):
     total_claims: int
     omitted_claims: int
     warnings: list[str]
+    verification: Literal["complete", "partial", "evidence_only"]
+    timings_ms: dict[str, float]
     summary: Summary
     claims: list[ClaimReport]
 

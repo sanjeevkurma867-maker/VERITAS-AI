@@ -477,8 +477,8 @@ class ApiTests(unittest.TestCase):
             "evidence": evidence,
         }]}
         sources = {1: [
-            {"url": NASA, "content": QUOTES["historical"] + " " + QUOTES["current"]},
-            {"url": IAU, "content": QUOTES["change"]},
+            {"url": NASA, "raw_content": QUOTES["historical"] + " " + QUOTES["current"]},
+            {"url": IAU, "raw_content": QUOTES["change"]},
         ]}
         env = {**TAVILY, "BIFROST_BASE_URL": "http://127.0.0.1:8080/openai/v1", "BIFROST_VIRTUAL_KEY": "fake-key",
                "BIFROST_AUTH_TOKEN": "fixture-token"}

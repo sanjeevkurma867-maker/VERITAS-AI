@@ -219,7 +219,8 @@ progress::-webkit-progress-value { border-radius: 8px; background: var(--cyan); 
 .claim-results { display: grid; gap: 13px; }
 .claim-card { padding: 23px 25px; overflow-wrap: anywhere; }
 .claim-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 7px 12px; margin-bottom: 7px; }
-.claim-meta > span:nth-child(2) { font-size: .875rem; color: var(--muted); }
+.claim-meta > span:not(.badge) { font-size: .875rem; color: var(--muted); }
+.claim-freshness { margin-left: auto; }
 .claim-card h3 { font-size: 1.29rem; line-height: 1.4; letter-spacing: -.015em; }
 .claim-explanation { color: #c2cde0; line-height: 1.6; margin-top: 6px; }
 .updated-claim {

@@ -21,6 +21,7 @@ const PIPELINES = {
   bifrost: "Tavily Search + Bifrost",
   tavily_research: "Tavily Research",
   tavily_search: "Tavily Search · evidence only",
+  tavily_search_rules: "Tavily Search · passage checks",
   recorded: "Recorded example",
 };
 const EVIDENCE_LABELS = {
@@ -51,6 +52,10 @@ function displayDate(value) {
 function displayTime(value) {
   if (!value || /^\d{4}$/.test(value)) return value || "";
   return /^\d{4}-\d{2}-\d{2}$/.test(value) ? displayDate(value) : value;
+}
+
+function claimScope(claim) {
+  return claim.recent_event ? "Recent event · UTC" : SCOPES[claim.time_scope];
 }
 
 function Badge({ status, children }) {
@@ -134,6 +139,8 @@ function Source({ source }) {
         {source.role !== "retrieved" && <span>{RELATIONS[source.relation]}</span>}
         {source.role !== "retrieved" && SUBJECT_SCOPES[source.subject_relation] && <span>{SUBJECT_SCOPES[source.subject_relation]}</span>}
         {quality && <span>{quality}</span>}
+        {source.grounding === "page_passage" && <span>Page passage matched</span>}
+        {source.cached && <span>Cached evidence</span>}
       </div>
       <p>{source.snippet}</p>
       {source.excerpt && source.excerpt !== source.snippet && (
@@ -141,6 +148,7 @@ function Source({ source }) {
       )}
       <a className="source-link" href={source.url} target="_blank" rel="noopener noreferrer">{source.title}</a>
       {source.published_date && <small className="publication">Published {displayDate(source.published_date)}</small>}
+      {source.retrieved_at && <small className="publication">Retrieved {displayDate(source.retrieved_at)}</small>}
     </div>
   );
 }
@@ -178,6 +186,9 @@ function Evidence({ claim }) {
 
 function ClaimCard({ claim }) {
   const [copyState, setCopyState] = useState("");
+  const freshnessReason = claim.time_scope === "historical" || claim.time_scope === "stable"
+    ? "Freshness applies to assessable present-day claims."
+    : "Freshness requires a verdict of Supported today or Outdated for a present-day claim.";
   async function copyCorrection() {
     try {
       await navigator.clipboard.writeText(claim.updated_claim);
@@ -191,9 +202,13 @@ function ClaimCard({ claim }) {
     <article className="panel claim-card">
       <div className="claim-meta">
         <Badge status={claim.status} />
-        <span>{SCOPES[claim.time_scope]}{claim.claim_period ? ` · ${displayTime(claim.claim_period)}` : ""}</span>
+        <span>{claimScope(claim)}{claim.claim_period ? ` · ${displayTime(claim.claim_period)}` : ""}</span>
+        <span className="claim-freshness" title={claim.freshness_score === null ? freshnessReason : undefined}>
+          Freshness {claim.freshness_score === null ? "unavailable" : `${claim.freshness_score}/100`}
+        </span>
       </div>
       <h3>{claim.claim}</h3>
+      {claim.interpretation && <p className="claim-explanation"><strong>Interpretation</strong> {claim.interpretation}</p>}
       <p className="claim-explanation">{claim.explanation}</p>
       {claim.updated_claim && (
         <div className="updated-claim">
@@ -219,13 +234,16 @@ function formatReport(report) {
     `${PIPELINES[report.pipeline]} · ${report.checked_at}`,
     `Freshness: ${report.summary.freshness.score ?? "Unavailable"}`,
     `Evidence coverage: ${report.summary.evidence_coverage.assessed}/${report.total_claims}`,
+    `Verification: ${report.verification.replaceAll("_", " ")}`,
   ];
   for (const warning of report.warnings) lines.push(warning);
   for (const claim of report.claims) {
-    lines.push("", `[${VERDICTS[claim.status]}] ${claim.claim}`, SCOPES[claim.time_scope] + (claim.claim_period ? ` (${claim.claim_period})` : ""), claim.explanation);
+    lines.push("", `[${VERDICTS[claim.status]}] ${claim.claim}`, claimScope(claim) + (claim.claim_period ? ` (${claim.claim_period})` : ""), claim.explanation);
+    lines.push(`Claim freshness: ${claim.freshness_score ?? "Unavailable"}`);
+    if (claim.interpretation) lines.push(`Interpretation: ${claim.interpretation}`);
     if (claim.updated_claim) lines.push(`Suggested correction: ${claim.updated_claim}`, claim.correction_url);
     for (const item of claim.sources) {
-      lines.push(`- ${item.title} (${EVIDENCE_LABELS[item.role]}${item.event_period ? `, ${item.event_period}` : ""})`, item.snippet, item.url);
+      lines.push(`- ${item.title} (${EVIDENCE_LABELS[item.role]}${item.event_period ? `, ${item.event_period}` : ""}${item.cached ? ", cached evidence" : ""})`, item.snippet, item.url);
     }
   }
   return lines.join("\n");
@@ -296,6 +314,8 @@ function Report({ report, previous }) {
             {report.mode === "live" ? ` · Checked ${dateTime.format(new Date(report.checked_at))}` : ""}
           </p>
           {report.inference_model && <p className="description model-name">{report.inference_model}</p>}
+          {report.verification !== "complete" && <p className="description">{report.verification === "partial" ? "Partial verification. Some claims need review." : "Verification incomplete. Review the retrieved evidence and gaps."}</p>}
+          {report.mode === "live" && report.timings_ms.total !== undefined && <p className="description model-name">Request time {(report.timings_ms.total / 1000).toFixed(1)}s</p>}
         </div>
         <div className="report-actions">
           <button className="button secondary" onClick={copyReport}>Copy report</button>
@@ -304,7 +324,7 @@ function Report({ report, previous }) {
         </div>
       </div>
       {report.warnings.length > 0 && (
-        <details className="runtime-notes" open={report.pipeline === "tavily_search" ? true : undefined}>
+        <details className="runtime-notes" open={report.verification !== "complete" ? true : undefined}>
           <summary>Verification limitations</summary>
           <ul>{report.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
         </details>

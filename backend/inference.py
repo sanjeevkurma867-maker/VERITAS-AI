@@ -47,6 +47,7 @@ class Assessment(StructuredOutput):
     subject_quantifier: SubjectQuantifier
     period: str = Field(max_length=100)
     explanation: str = Field(min_length=1, max_length=1000)
+    interpretation: str = Field(default="", max_length=300)
     updated_claim: str = Field(max_length=600)
     correction_source_id: str = Field(max_length=30)
     correction_quote: str = Field(max_length=500)
@@ -73,6 +74,9 @@ EFFECTIVE_EVIDENCE_GUIDANCE = """Keep the claim's entity, competition or other q
 across periods. Resolve ordinary shorthand only when the supplied context or evidence identifies it.
 If plausible readings change the verdict, explain the ambiguity. Only count prior support if it
 establishes the same proposition, including its scope.
+Use scope unclear if reasonable interpretations still lead to materially different verdicts. If using a
+defensible conventional definition, explicitly state it in interpretation. Otherwise leave interpretation
+empty. For an event with a resolved relative window, look for the exact event date in that UTC window.
 
 For each claim, use subject_quantifier: absence for a claim that none exist or none ever occurred,
 existence for a claim that at least one exists or occurred, or exact for a number, rank, specific
@@ -116,7 +120,7 @@ and correction_quote to the source ID and exact quote that establish the replace
 wording in the same order as the quote, reusing its words. Use empty strings
 for all three fields when unavailable.
 Return a JSON object with assessments (one per claim ID). Each object has id, scope, subject_quantifier,
-period, explanation, updated_claim, correction_source_id, correction_quote, and evidence. Each evidence
+period, explanation, interpretation, updated_claim, correction_source_id, correction_quote, and evidence. Each evidence
 object has source_id, role, relation, subject_relation, quote, period, and summary. Use plain text fields."""
 
 

@@ -6,6 +6,11 @@ VERITAS AI detects stale claims in AI-generated answers. An AI answer can repeat
 
 Paste an answer to get claim-level verdicts, dated citations, evidence-backed corrections, and an exportable verification report. The **Then → Change → Now** timeline makes the difference between outdated wording and accurate history visible. The dashboard keeps the last completed report available during a follow-up request or provider error.
 
+- Review up to five individual claims and see their time scope, verdict, and evidence.
+- Follow cited passages through a change and copy the grounded correction.
+- Inspect per-claim freshness, answer freshness, evidence coverage, and verification completeness. Copy the report or download its JSON.
+- Run three labeled recorded scenarios without API access.
+
 ## Screenshots
 
 ![VERITAS AI workspace with the Pluto timeline and recorded examples](docs/workspace.png)
@@ -45,25 +50,27 @@ Open the [Vite development dashboard](http://127.0.0.1:5173/app/).
 flowchart LR
     UI["React dashboard"] --> API["FastAPI verification API"]
     API --> Extract["Atomic claims and time scope<br/>Bifrost extraction when configured"]
-    Extract --> Search["Tavily Search<br/>current and historical excerpts"]
-    Search --> Gateway["Bifrost OpenAI-compatible gateway"]
+    Extract --> Search["Tavily Search<br/>source passages and bounded cache"]
+    Search --> Gateway["Bifrost OpenAI-compatible gateway, when authorized"]
     Gateway --> Groq["Groq model for structured assessment"]
-    Groq --> Validate["Citation, excerpt, period and verdict checks"]
-    Extract --> Research["Tavily Research<br/>alternate live reasoning"]
-    Research --> Validate
-    Search --> Review["Evidence-only review when reasoning is unavailable"]
+    Groq --> Validate["Check source quality, quote, scope and effective dates"]
+    Search --> Rules["Deterministic passage checks for supported claim patterns"]
+    Rules --> Validate
+    Extract --> Research["Tavily Research for unresolved claims"]
+    Research --> Page["Tavily Extract checks proposed quotes against source pages"]
+    Page --> Validate
     Validate --> Report["Verdicts, timelines, metrics and corrections"]
-    Review --> Report
     Report --> UI
 ```
 
-The stack is FastAPI, Pydantic, HTTPX, React, Vite, Tavily Search and Research, and an optional Bifrost gateway routing to Groq. The browser calls FastAPI. FastAPI sends selected claims to Tavily and, when configured, sends source excerpts and claim data to Bifrost. API credentials are read server-side.
+The stack is FastAPI, Pydantic, HTTPX, React, Vite, Tavily Search, Research and Extract, and an optional Bifrost gateway routing to Groq. The browser calls FastAPI. FastAPI sends selected claims to Tavily and, when configured, sends source excerpts and claim data to Bifrost. API credentials are read server-side. The backend uses Tavily’s REST APIs directly.
 
 | Pipeline shown in the report | How the result is produced |
 | --- | --- |
 | Tavily Search + Bifrost | The gateway extracts atomic claims and assesses retrieved excerpts. The backend checks structured output, claim-specific source IDs, quoted text, and dates before assigning verdicts. |
-| Tavily Research | Research supplies temporal assessments and citations. The backend checks source and period coverage and assigns a verdict from the evidence roles. |
-| Tavily Search · evidence only | Search supplies excerpts when reasoning is unavailable. Claims receive **Needs review** and freshness is unavailable. |
+| Tavily Research | Research proposes temporal assessments. Tavily Extract retrieves the cited page text so the backend can verify each decisive quote and check the source roles and effective periods. |
+| Tavily Search + passage checks | Structured checks can resolve eligible lifecycle, dated event, and stable attribution claims from the retrieved page text. Other claims can remain in review. |
+| Tavily Search · evidence only | Search supplies context when qualifying evidence or reasoning is unavailable. Claims receive **Needs review** and freshness is unavailable. |
 | Recorded example | Source-backed demonstration data exercises the report interface locally. |
 
 ### Server configuration
@@ -97,7 +104,7 @@ The dated transition requires evidence of a specific change. Effective periods d
 
 Evidence also has to match the claim’s entity and qualifiers. A team’s win can disprove an organization-wide claim of zero wins. That team's earlier record by itself describes only the team. Evidence outside the claim’s scope is available as context. The API returns `subject_quantifier` for the claim and `subject_relation` for each citation. A bounded Tavily follow-up can clarify missing historical or current evidence while preserving an established verdict.
 
-**Answer freshness** is the percentage of assessable present-day claims that still hold, calculated as `supported current / (supported current + outdated)`. The report shows which claims were counted and any present-day claims excluded from the score. **Evidence coverage** is the share of checked claims that reached a cited verdict. Both are descriptive metrics. Claim-level freshness is 100 for supported present-day claims, 0 for outdated claims, and unavailable for the other results.
+**Answer freshness** is the percentage of assessable present-day claims that still hold, calculated as `supported current / (supported current + outdated)`. The report shows which claims were counted and any present-day claims excluded from the score. Claim-level freshness is 100 for supported present-day claims, 0 for outdated claims, and unavailable for other results. **Evidence coverage** counts claims with a decisive, validated citation. **Verification completeness** reports whether all, some, or none of the checked claims were resolved. These are descriptive measures. A source’s retrieved date, effective period, and publication date have different meanings. Cached passages retain their original retrieval date and are labeled in the report.
 
 ### API
 
@@ -112,9 +119,16 @@ Evidence also has to match the claim’s entity and qualifiers. A team’s win c
 
 Requests accept up to 6,000 characters. The report checks the first five distinct candidate claims and counts omitted candidates. FastAPI limits concurrent verifications per process and reports unavailable providers through bounded requests and readable errors.
 
-## 60–90-second demo
+```sh
+curl -fsS 'http://127.0.0.1:8000/demo?scenario=mixed'
+curl -fsS http://127.0.0.1:8000/verify \
+  -H 'Content-Type: application/json' \
+  --data '{"answer":"Python 2 is officially supported. In 1990, Nelson Mandela was released from prison."}'
+```
 
-Open **Four claims, four verdicts** for the recorded walkthrough. It pairs Pluto’s present-day and 2005 classifications with one supported and one contradicted claim about Python’s creation. Walk through **Then**, **Change**, and **Now**, show the IAU citation, and copy the correction. Start a separate live check before the talk if you want to show the active provider. [Timed script and pitch outline](docs/pitch.md)
+## Demo and submission
+
+Open **Four claims, four verdicts** for the 105-second recorded walkthrough. It pairs Pluto’s present-day and 2005 classifications with one supported and one contradicted claim about Python’s creation. Walk through **Then**, **Change**, and **Now**, show the IAU citation, and copy the correction. The two-claim API example above is the separate live preview. [Timed script](docs/pitch.md) · [PowerPoint](docs/VERITAS-AI.pptx) · [Hackathon requirement checks](docs/hackathon-compliance.md)
 
 ## Tests and limitations
 
@@ -127,14 +141,17 @@ Tests cover all five verdicts, compound extraction, exact dates, organization ve
 
 | Local integration check | Result |
 | --- | --- |
-| Tavily Search | Returned live excerpts through the evidence-only fallback. |
-| Tavily Research | Returned all five expected verdicts in the React dashboard and passed the live franchise-versus-team scope check. |
-| Bifrost → Groq | Local gateway health returned 200 and the protected management endpoint returned 401. Earlier inference returned 401. The app needs an authorized inference credential for a live Groq check. |
+| Tavily Search | Returned page-backed **Outdated** and **Historically correct** verdicts in a two-claim test with Research disabled. |
+| Tavily Research and Extract | The current Research probe returned a request or credit limit. The earlier release reached live Research. The current quote-checking path using Extract passed simulated provider tests. |
+| Bifrost → Groq | Local gateway health returned 200. Protected management and earlier inference returned HTTP 401. The backend needs an authorized inference key for a live Groq check. |
 
-- Live reasoning depends on provider access, source quality, and latency. Search-only reports preserve evidence for manual review.
+- Live reasoning depends on provider access, source quality, and latency. Passage rules cover a limited set of patterns. General claims may need Research or authenticated Bifrost.
 - Without configured Bifrost access, extraction uses English sentence and clause rules. Complex clauses and temporal expressions can require manual review. Subject relationships are proposed by the reasoning provider and checked against the claim’s quantifier, so ambiguous entity names still need care.
-- Source quality categories are heuristic. A single research provider’s assessment still warrants checking the linked sources.
-- Live Bifrost inference requires an authorized gateway and working Groq provider configuration.
+- Publisher categories are heuristic. A page quote can confirm citation provenance, while judging semantic relevance for open-ended claims still depends on reasoning quality. Some pages return incomplete extracts.
+
+## Attribution
+
+The recorded scenarios cite the International Astronomical Union, NASA, and the Python Software Foundation. The dashboard links to the cited source passages. Implementation and submission materials were developed with assistance from ChatGPT and Codex.
 
 ## Roadmap
 
