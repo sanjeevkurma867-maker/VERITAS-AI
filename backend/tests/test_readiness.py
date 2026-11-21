@@ -14,7 +14,7 @@ from backend.inference import BifrostClient, InferenceUnavailable
 from backend.main import app
 from backend.tavily_search import cached_search
 from backend.verifier import (
-    VerificationUnavailable, build_report, ground_research, request_research,
+    VerificationUnavailable, build_report, corroboration_gap, ground_research, request_research,
     search_only_report, source_index, sufficient, verify_at,
 )
 
@@ -200,6 +200,18 @@ class ProviderIntegrityTests(unittest.TestCase):
                 self.assertEqual(claim["sources"][0]["relation"], "context")
                 self.assertIsNone(claim["sources"][0]["excerpt"])
 
+    def test_unmatched_change_is_only_a_retrieved_link_and_cannot_trigger_research(self):
+        response = self.research_report()
+        item = response["content"]["assessments"][0]["evidence"][0]
+        item.update(role="change", relation="context", period="2020-01-01")
+        raw = ground_research(response, self.extractor("The project policy addresses installation."), monotonic() + 8)
+        claim = build_report([LIFE], raw, NOW)["claims"][0]
+        citation = claim["sources"][0]
+        self.assertEqual(citation["role"], "retrieved")
+        self.assertIsNone(citation["event_period"])
+        self.assertNotIn("support ended", citation["snippet"])
+        self.assertIsNone(corroboration_gap(claim))
+
     def test_unknown_citation_is_never_sent_to_extract(self):
         client = self.extractor(POLICY)
         raw = ground_research(self.research_report(citation="https://fabricated.example.net/article"),
@@ -216,22 +228,22 @@ class ProviderIntegrityTests(unittest.TestCase):
         ]
         self.assertFalse(sufficient(duplicate))
 
-    def test_rate_limit_opens_research_cooldown(self):
-        provider = Mock()
-        provider.post.return_value = httpx.Response(
-            429, request=httpx.Request("POST", "https://api.tavily.com/research"), headers={"Retry-After": "30"},
-        )
-        context = Mock()
-        context.__enter__ = Mock(return_value=provider)
-        context.__exit__ = Mock(return_value=False)
+    def test_research_limits_are_distinct_and_open_cooldown(self):
         claims = extract_candidates(LIFE, TODAY)
-        with patch("backend.verifier.httpx.Client", return_value=context) as new_client:
-            with self.assertRaisesRegex(VerificationUnavailable, "request or credit limit"):
-                request_research("rate-fixture", claims, TODAY)
-            with self.assertRaisesRegex(VerificationUnavailable, "cooling down"):
-                request_research("rate-fixture", claims, TODAY)
-            new_client.assert_called_once()
-            provider.post.assert_called_once()
+        for status, message in ((429, "rate limit"), (432, "plan usage limit"), (433, "pay-as-you-go limit")):
+            key = f"limit-fixture-{status}"
+            provider = Mock()
+            provider.post.return_value = httpx.Response(
+                status, request=httpx.Request("POST", "https://api.tavily.com/research"), headers={"Retry-After": "30"},
+            )
+            context = Mock(__enter__=Mock(return_value=provider), __exit__=Mock(return_value=False))
+            with self.subTest(status=status), patch("backend.verifier.httpx.Client", return_value=context) as new_client:
+                with self.assertRaisesRegex(VerificationUnavailable, message):
+                    request_research(key, claims, TODAY)
+                with self.assertRaisesRegex(VerificationUnavailable, "cooling down"):
+                    request_research(key, claims, TODAY)
+                new_client.assert_called_once()
+                provider.post.assert_called_once()
 
     def test_bifrost_timeout_surfaces_safe_error(self):
         gateway = BifrostClient("http://127.0.0.1:8080/openai/v1", "fixture")

@@ -34,6 +34,12 @@ load_dotenv(Path(__file__).with_name(".env"))
 RESEARCH_TIMEOUT = 70
 RESEARCH_FOLLOWUP_TIMEOUT = 30
 VERIFICATION_BUDGET = 130
+RESEARCH_LIMIT_ERRORS = {
+    429: "Tavily Research hit its request rate limit (HTTP 429).",
+    432: "Tavily Research hit the plan usage limit (HTTP 432).",
+    433: "Tavily Research hit the pay-as-you-go limit (HTTP 433).",
+    434: "Tavily Research reported a provider limit (HTTP 434).",
+}
 ROLES = ("historical", "current", "change")
 RELATIONS = ("supports", "contradicts", "context")
 SUBJECT_RELATIONS = ("same", "narrower", "broader", "different", "unclear")
@@ -241,8 +247,8 @@ def request_research(api_key, claims, today, *, timeout=RESEARCH_TIMEOUT, prior_
         code = error.response.status_code
         if code in {401, 403}:
             message = "Tavily Research rejected its credentials or access."
-        elif code in {429, 432, 433, 434}:
-            message = "Tavily Research reached a request or credit limit."
+        elif code in RESEARCH_LIMIT_ERRORS:
+            message = RESEARCH_LIMIT_ERRORS[code]
             retry = error.response.headers.get("Retry-After", "")
             pause = min(900, max(1, int(retry))) if retry.isascii() and retry.isdecimal() and len(retry) <= 8 else 120
             with _research_lock:
@@ -403,10 +409,13 @@ def ground_research(report, client, deadline):
             item["grounding"] = "page_passage"
             if not period_grounded(clean_text(item.get("period"), 100), quote):
                 unconfirmed_period = True
-                item.update(relation="context", period="")
+                item.update(relation="context", period="", summary=quote)
             continue
         unconfirmed = True
-        item.update(relation="context", quote="", grounding="retrieved_only")
+        item.update(
+            role="retrieved", relation="context", subject_relation="unclear", period="", quote="",
+            summary="No matching passage was verified on this page.", grounding="retrieved_only",
+        )
 
     for source in report["sources"] if isinstance(report.get("sources"), list) else []:
         if not isinstance(source, dict):
@@ -476,7 +485,8 @@ def collect_evidence(items, known_sources, quantifier):
         source = known_sources.get(key)
         role = item.get("role")
         relation = item.get("relation")
-        if not source or role not in ROLES or relation not in RELATIONS:
+        retrieved_only = role == "retrieved" and item.get("grounding") == "retrieved_only"
+        if not source or (role not in ROLES and not retrieved_only) or relation not in RELATIONS:
             continue
         snippet = clean_text(item.get("summary"), 500)
         period = clean_text(item.get("period"), 100)
